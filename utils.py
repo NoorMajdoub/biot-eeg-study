@@ -1,4 +1,6 @@
 import pickle
+import csv
+import glob
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -7,7 +9,282 @@ from scipy.signal import resample
 from scipy.signal import butter, iirnotch, filtfilt
 from scipy.interpolate import interp1d
 from scipy.signal import butter, lfilter
+import json
+import mne
 
+class SleepEDFLoader(torch.utils.data.Dataset):
+    """
+    Sleep-EDF 5-class sleep staging (W/N1/N2/N3/REM). seq/<rec>.npy
+    (n_epochs, 2, 6000) float32 @ 200Hz (Fpz-Cz, Pz-Oz; 30s epochs),
+    labels/<rec>.npy (n_epochs,) int64 (0=W,1=N1,2=N2,3=N3,4=REM),
+    epoch_qc/<rec>.npy (n_epochs,) float32 -- a CONTINUOUS fraction of
+    artifact/noise per epoch (observed range 0 to ~0.96, not binary).
+    qc_threshold excludes any epoch above that fraction; 0.2 is an
+    assumed default.
+    """
+    def __init__(self, root, recordings, sampling_rate=200, qc_threshold=0.2):
+        self.root = root
+        self.sampling_rate = sampling_rate
+        self.default_rate = 200
+        self._seq_cache = {}
+        self._labels_cache = {}
+
+        self.index = []  # (recording, epoch_idx)
+        for rec in recordings:
+            labels = np.load(os.path.join(root, "labels", f"{rec}.npy"))
+            qc = np.load(os.path.join(root, "epoch_qc", f"{rec}.npy"))
+            for i in range(len(labels)):
+                if qc[i] > qc_threshold:
+                    continue
+                self.index.append((rec, i))
+
+    def __len__(self):
+        return len(self.index)
+
+    def _get_seq(self, rec):
+        if rec not in self._seq_cache:
+            self._seq_cache[rec] = np.load(os.path.join(self.root, "seq", f"{rec}.npy"), mmap_mode="r")
+        return self._seq_cache[rec]
+
+    def _get_labels(self, rec):
+        if rec not in self._labels_cache:
+            self._labels_cache[rec] = np.load(os.path.join(self.root, "labels", f"{rec}.npy"))
+        return self._labels_cache[rec]
+
+    def __getitem__(self, idx):
+        rec, i = self.index[idx]
+        X = np.array(self._get_seq(rec)[i])  # (2, 6000)
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, int(30 * self.sampling_rate), axis=-1)
+        X = X / (np.quantile(np.abs(X), q=0.95, axis=-1, keepdims=True) + 1e-8)
+        X = torch.FloatTensor(X)
+        y = int(self._get_labels(rec)[i])
+        return X, y
+
+class ThingsEEG1Loader(torch.utils.data.Dataset):
+    """
+    THINGS-EEG1 binary istarget (RSVP oddball fixation-colour-change) detection.
+    Each "file" is really a subject directory (e.g. 'sub-30') containing
+    eeg/<subject>_task-rsvp_eeg.{vhdr,eeg,vmrk} (BrainVision, native 1000Hz,
+    63 real channels) and eeg/<subject>_task-rsvp_events.tsv. Every row of
+    the events file becomes one window: [time_stimon, time_stimon+window_seconds)
+    at the recording's native rate, resampled to sampling_rate (must be 200Hz
+    for pretrained-weight compatibility). Label = istarget (0/1); istarget=1
+    is extremely rare (~1.2% of events). When balance_ratio is set (e.g. 10),
+    non-target events are randomly subsampled per-subject so the loader
+    yields at most balance_ratio * (# target events) non-target windows --
+    intended for the TRAIN split only; pass balance_ratio=None for val/test
+    to keep the natural distribution for honest AUROC/PR-AUC reporting.
+    """
+    def __init__(self, root, subject_dirs, sampling_rate=200, window_seconds=0.5,
+
+                 balance_ratio=None, seed=42):
+
+        self.root = root
+
+        self.sampling_rate = sampling_rate
+
+        self.window_seconds = window_seconds
+
+        self._raw_cache = {}
+
+        self._sfreq_cache = {}
+
+
+
+        rng = np.random.RandomState(seed)
+
+        self.index = []  # (subject, start_sample_native, label)
+
+
+
+        for subj in subject_dirs:
+
+            eeg_dir = os.path.join(root, subj, "eeg")
+
+            vhdr_candidates = glob.glob(os.path.join(eeg_dir, "*_eeg.vhdr"))
+
+            events_candidates = glob.glob(os.path.join(eeg_dir, "*_events.tsv"))
+
+            if not vhdr_candidates or not events_candidates:
+
+                print(f"WARNING: missing vhdr/events for {subj}, skipping")
+
+                continue
+
+            vhdr = vhdr_candidates[0]
+
+            events_tsv = events_candidates[0]
+
+
+
+            raw = mne.io.read_raw_brainvision(vhdr, preload=False, verbose=False)
+
+            native_sfreq = raw.info["sfreq"]
+
+            n_times = raw.n_times
+
+            self._sfreq_cache[subj] = native_sfreq
+
+
+
+            window_samples = int(round(window_seconds * native_sfreq))
+
+
+
+            with open(events_tsv) as f:
+
+                reader = csv.DictReader(f, delimiter="	")
+
+                rows = list(reader)
+
+
+
+            if not rows or "time_stimon" not in rows[0]:
+
+                print(f"WARNING: {subj} events file missing time_stimon column, skipping subject")
+
+                continue
+
+
+
+            target_rows = []
+
+            nontarget_rows = []
+
+            for row in rows:
+
+                onset_s = float(row["time_stimon"])
+
+                start = int(round(onset_s * native_sfreq))
+
+                if start + window_samples > n_times:
+
+                    continue
+
+                label = int(row["istarget"])
+
+                if label == 1:
+
+                    target_rows.append((subj, start, label))
+
+                else:
+
+                    nontarget_rows.append((subj, start, label))
+
+
+
+            if balance_ratio is not None and len(target_rows) > 0:
+
+                keep_n = min(len(nontarget_rows), balance_ratio * len(target_rows))
+
+                keep_idx = rng.choice(len(nontarget_rows), size=keep_n, replace=False)
+
+                nontarget_rows = [nontarget_rows[i] for i in keep_idx]
+
+
+
+            self.index.extend(target_rows)
+
+            self.index.extend(nontarget_rows)
+
+
+
+    def __len__(self):
+        return len(self.index)
+
+    def _get_raw(self, subj):
+        if subj not in self._raw_cache:
+            eeg_dir = os.path.join(self.root, subj, "eeg")
+            vhdr = glob.glob(os.path.join(eeg_dir, "*_eeg.vhdr"))[0]
+            raw = mne.io.read_raw_brainvision(vhdr, preload=False, verbose=False)
+            self._raw_cache[subj] = raw
+        return self._raw_cache[subj]
+
+    def __getitem__(self, idx):
+        subj, start, label = self.index[idx]
+        raw = self._get_raw(subj)
+        native_sfreq = self._sfreq_cache[subj]
+        window_samples = int(round(self.window_seconds * native_sfreq))
+        X = raw.get_data(start=start, stop=start + window_samples)  # (63, window_samples) @ native_sfreq
+
+        if self.sampling_rate != native_sfreq:
+            target_samples = int(round(self.window_seconds * self.sampling_rate))
+            X = resample(X, target_samples, axis=-1)
+
+        X = X / (np.quantile(np.abs(X), q=0.95, axis=-1, keepdims=True) + 1e-8)
+        X = torch.FloatTensor(X)
+        return X, label
+class CAUEEGLoader(torch.utils.data.Dataset):
+    """
+    CAUEEG Dementia (3-class: Normal/MCI/Dementia). Each EDF recording
+    (~17 min avg) is chunked into non-overlapping 10s windows at index-build
+    time; every window inherits its recording's single class label. Only
+    the 19 real EEG channels are kept (EKG, Photic dropped). Labels come
+    from dementia-no-overlap.json's {split}_split lists, matched by serial
+    number parsed from each EDF filename -- NOT from the train-only capped
+    manifest, so this works identically for train/val/test.
+    """
+    EEG_CHANNELS = [
+        'Fp1-AVG', 'F3-AVG', 'C3-AVG', 'P3-AVG', 'O1-AVG',
+        'Fp2-AVG', 'F4-AVG', 'C4-AVG', 'P4-AVG', 'O2-AVG',
+        'F7-AVG', 'T3-AVG', 'T5-AVG', 'F8-AVG', 'T4-AVG', 'T6-AVG',
+        'FZ-AVG', 'CZ-AVG', 'PZ-AVG',
+    ]
+    ANNOTATION_PATH = "/scratch/nourmaj/caueeg/caueeg-dataset/dementia-no-overlap.json"
+
+    def __init__(self, root, files, sampling_rate=200, window_seconds=10):
+        self.root = root
+        self.files = files
+        self.sampling_rate = sampling_rate
+        self.window_seconds = window_seconds
+        self._raw_cache = {}
+
+        with open(self.ANNOTATION_PATH) as f:
+            ann = json.load(f)
+        self.serial_to_label = {}
+        for key in ("train_split", "validation_split", "test_split"):
+            for entry in ann[key]:
+                self.serial_to_label[entry["serial"]] = entry["class_label"]
+
+        # Build a flat (filename, window_index) index so __getitem__ can
+        # address individual windows directly.
+        self.index = []
+        for fname in self.files:
+            serial = os.path.splitext(fname)[0]
+            if serial not in self.serial_to_label:
+                print(f"WARNING: {fname} has no label in annotation file, skipping")
+                continue
+            raw = mne.io.read_raw_edf(os.path.join(root, fname), preload=False, verbose=False)
+            sfreq = raw.info["sfreq"]
+            n_windows = int(raw.n_times // (sfreq * window_seconds))
+            for w in range(n_windows):
+                self.index.append((fname, w))
+
+    def __len__(self):
+        return len(self.index)
+
+    def _get_raw(self, fname):
+        if fname not in self._raw_cache:
+            raw = mne.io.read_raw_edf(os.path.join(self.root, fname), preload=False, verbose=False)
+            raw.pick_channels(self.EEG_CHANNELS, ordered=True)
+            self._raw_cache[fname] = raw
+        return self._raw_cache[fname]
+
+    def __getitem__(self, idx):
+        fname, w = self.index[idx]
+        serial = os.path.splitext(fname)[0]
+        y = self.serial_to_label[serial]
+
+        raw = self._get_raw(fname)
+        sfreq = raw.info["sfreq"]
+        start = int(w * self.window_seconds * sfreq)
+        stop = start + int(self.window_seconds * sfreq)
+        X = raw.get_data(start=start, stop=stop)  # (19, 2000) at 200Hz/10s
+
+        X = X / (np.quantile(np.abs(X), q=0.95, axis=-1, keepdims=True) + 1e-8)
+        X = torch.FloatTensor(X)
+        return X, y
 
 class TUABLoader(torch.utils.data.Dataset):
     def __init__(self, root, files, sampling_rate=200):
@@ -104,6 +381,204 @@ class TUEVLoader(torch.utils.data.Dataset):
             + 1e-8
         )
         Y = int(sample["label"][0] - 1)
+        X = torch.FloatTensor(X)
+        return X, Y
+
+
+class ISRUCLoader(torch.utils.data.Dataset):
+    """
+    ISRUC 5-class sleep staging (Wake/N1/N2/N3/REM), flattened from CBraMod's
+    non-overlapping 20-epoch sequence format into individual 30s epochs by
+    preprocess_isruc_biot.py. Each pkl file has keys 'X' (6, 6000) @ 200Hz
+    and 'y' (int, 0-4).
+    """
+    def __init__(self, root, files, sampling_rate=200):
+        self.root = root
+        self.files = files
+        self.default_rate = 200  # already resampled to 200Hz during CBraMod's own preprocessing
+        self.sampling_rate = sampling_rate
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["X"]  # (6, 6000), 30s @ 200Hz
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, int(30 * self.sampling_rate), axis=-1)
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        Y = sample["y"]
+        X = torch.FloatTensor(X)
+        return X, Y
+
+
+class Yang2025Loader(torch.utils.data.Dataset):
+    """
+    Yang2025 (WBCIC-SHU) binary motor imagery: left hand vs right hand.
+    Yang, Rong, Xie, et al. (2025), Scientific Data, DOI: 10.1038/s41597-025-04826-y.
+    Recorded at 1000Hz, downsampled to 250Hz during preprocessing. Each pkl file
+    has keys 'X' (59, 1500) float32 @ 250Hz (6s trials: 1.5s cue window trimmed,
+    leaving the labeled MI-period epoch) and 'y' (int, 0=left hand, 1=right hand).
+    59 real EEG channels, standard_1005 (10-05) montage, Neuracle NeuSen W cap.
+    """
+    def __init__(self, root, files, sampling_rate=200):
+        self.root = root
+        self.files = files
+        self.default_rate = 250  # native rate after the dataset's own preprocessing
+        self.sampling_rate = sampling_rate
+        self.trial_seconds = 6  # 1500 samples / 250Hz
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["X"]  # (59, 1500), 6s @ 250Hz
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, int(self.trial_seconds * self.sampling_rate), axis=-1)
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        Y = sample["y"]
+        X = torch.FloatTensor(X)
+        return X, Y
+
+
+class ClinicalLoader(torch.utils.data.Dataset):
+    """
+    ds004504 clinical EEG, binary FTD-vs-HC classification (matching the REVE
+    build's label convention). Each pkl file has keys 'X' (19, 5000) float32
+    @ 500Hz (10s resting-state windows, raw volts) and 'y' (int, 0/1).
+    19 real 10-20 system channels: Fp1, Fp2, F3, F4, C3, C4, P3, P4, O1, O2,
+    F7, F8, T3, T4, T5, T6, Fz, Cz, Pz.
+    """
+    def __init__(self, root, files, sampling_rate=200):
+        self.root = root
+        self.files = files
+        self.default_rate = 500  # native rate of the dataset's own preprocessing
+        self.sampling_rate = sampling_rate
+        self.trial_seconds = 10  # 5000 samples / 500Hz
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["X"]  # (19, 5000), 10s @ 500Hz
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, int(self.trial_seconds * self.sampling_rate), axis=-1)
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        Y = sample["y"]
+        X = torch.FloatTensor(X)
+        return X, Y
+
+
+class DreamLoader(torch.utils.data.Dataset):
+    """
+    DREAM (Tononi Serial Awakenings, Siclari et al. 2017) binary
+    Experience-vs-no-Experience classification. Each pkl file has keys
+    'X' (257, 10000) float32 @ 500Hz (last 20s of each 120s episode,
+    raw volts) and 'y' (int, 0/1). 257 real channels on a custom EGI
+    HydroCelGSN256v10 net (no standard 10-20 names) -- BIOT does not need
+    real positions (unlike REVE), so this is a non-issue here. Note: 257
+    channels is far more than the pretrained checkpoint's 18, so the
+    channel-mismatch skip logic in run_binary_supervised.py will
+    reinitialize most/all channel-dependent layers even for "pretrained" runs.
+    """
+    def __init__(self, root, files, sampling_rate=200):
+        self.root = root
+        self.files = files
+        self.default_rate = 500  # native rate of the dataset's own preprocessing
+        self.sampling_rate = sampling_rate
+        self.trial_seconds = 20  # 10000 samples / 500Hz
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["X"]  # (257, 10000), 20s @ 500Hz
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, int(self.trial_seconds * self.sampling_rate), axis=-1)
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        Y = sample["y"]
+        X = torch.FloatTensor(X)
+        return X, Y
+
+
+class ThoughtVizLoader(torch.utils.data.Dataset):
+    """
+    ThoughtViz 10-class object-category classification. Each pkl file has
+    keys 'X' (14, 32) float32 @ 128Hz (0.25s window, real EEGNet stimulus
+    data -- known unfixable train/test overlap-window leakage per the
+    ThoughtViz paper, same caveat as the REVE build) and 'y' (int, 0-9).
+    Unlike REVE (hard patch_size=200, forced zero-padding 50->200), BIOT's
+    STFT-based tokenization can process the real 0.25s window directly with
+    no padding -- just requires a much smaller --token_size/--hop_length
+    than BIOT's usual defaults (200/100), since the real signal is only
+    ~50 samples after resampling to 200Hz.
+    """
+    def __init__(self, root, files, sampling_rate=200):
+        self.root = root
+        self.files = files
+        self.default_rate = 128  # native rate (14, 32) was recorded at
+        self.sampling_rate = sampling_rate
+        self.trial_seconds = 0.25  # 32 samples / 128Hz
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["X"]  # (14, 32), 0.25s @ 128Hz
+        if self.sampling_rate != self.default_rate:
+            X = resample(X, int(round(self.trial_seconds * self.sampling_rate)), axis=-1)
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        Y = sample["y"]
+        X = torch.FloatTensor(X)
+        return X, Y
+
+
+class KaraOneLoader(torch.utils.data.Dataset):
+    """
+    KaraOne imagined-speech binary classification. Each pkl file has keys
+    'X' (60, ~4960-4970) float32 @ 1000Hz (trial length varies slightly
+    trial-to-trial, ~5s) and 'y' (int, 0/1). 60 real 10-10 system channels.
+    Resamples to a fixed 5s target regardless of the exact native length,
+    same as the REVE build's convention.
+    """
+    def __init__(self, root, files, sampling_rate=200):
+        self.root = root
+        self.files = files
+        self.default_rate = 1000  # nominal native rate; actual trial length varies slightly
+        self.sampling_rate = sampling_rate
+        self.trial_seconds = 5
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        sample = pickle.load(open(os.path.join(self.root, self.files[index]), "rb"))
+        X = sample["X"]  # (60, ~4960-4970), ~5s @ 1000Hz
+        X = resample(X, int(self.trial_seconds * self.sampling_rate), axis=-1)
+        X = X / (
+            np.quantile(np.abs(X), q=0.95, method="linear", axis=-1, keepdims=True)
+            + 1e-8
+        )
+        Y = sample["y"]
         X = torch.FloatTensor(X)
         return X, Y
 

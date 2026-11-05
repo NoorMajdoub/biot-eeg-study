@@ -22,20 +22,27 @@ from model import (
     STTransformer,
     BIOTClassifier,
 )
-from utils import TUABLoader, CHBMITLoader, PTBLoader, focal_loss, BCE
-
+from utils import TUABLoader, CHBMITLoader, PTBLoader, Yang2025Loader, ClinicalLoader, DreamLoader, KaraOneLoader, focal_loss, BCE
+from utils import ThingsEEG1Loader  # noqa: E402
 
 class LitModel_finetune(pl.LightningModule):
-    def __init__(self, args, model):
+    def __init__(self, args, model, pos_weight=None):
         super().__init__()
         self.model = model
         self.threshold = 0.5
         self.args = args
+        self.pos_weight = pos_weight
 
     def training_step(self, batch, batch_idx):
         X, y = batch
         prob = self.model(X)
-        loss = BCE(prob, y)  # focal_loss(prob, y)
+        if self.pos_weight is not None:
+            pw = torch.tensor(self.pos_weight, device=prob.device, dtype=prob.dtype)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                prob.view(-1, 1), y.view(-1, 1).float(), pos_weight=pw
+            )
+        else:
+            loss = BCE(prob, y)  # focal_loss(prob, y)
         self.log("train_loss", loss)
         return loss
 
@@ -126,7 +133,7 @@ class LitModel_finetune(pl.LightningModule):
 
 def prepare_TUAB_dataloader(args):
     # set random seed
-    seed = 12345
+    seed = args.seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -169,16 +176,58 @@ def prepare_TUAB_dataloader(args):
     print(len(train_loader), len(val_loader), len(test_loader))
     return train_loader, test_loader, val_loader
 
-
-def prepare_CHB_MIT_dataloader(args):
-    # set random seed
-    seed = 12345
+def prepare_ThingsEEG1_dataloader(args):
+    seed = args.seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    root = "/srv/local/data/physionet.org/files/chbmit/1.0.0/clean_segments"
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/things_eeg1/splits")
+
+    train_subjects = os.listdir(os.path.join(root, "train"))
+    val_subjects = os.listdir(os.path.join(root, "val"))
+    test_subjects = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_subjects), len(val_subjects), len(test_subjects))
+
+    train_loader = torch.utils.data.DataLoader(
+        ThingsEEG1Loader(os.path.join(root, "train"), train_subjects, args.sampling_rate,
+                          balance_ratio=10, seed=seed),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        ThingsEEG1Loader(os.path.join(root, "test"), test_subjects, args.sampling_rate,
+                          balance_ratio=None),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        ThingsEEG1Loader(os.path.join(root, "val"), val_subjects, args.sampling_rate,
+                          balance_ratio=None),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+    
+def prepare_CHB_MIT_dataloader(args):
+    # set random seed
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/chb-mit-processed-80h")
 
     train_files = os.listdir(os.path.join(root, "train"))
     val_files = os.listdir(os.path.join(root, "val"))
@@ -215,9 +264,229 @@ def prepare_CHB_MIT_dataloader(args):
     return train_loader, test_loader, val_loader
 
 
+def prepare_JapanEEG_dataloader(args):
+    # set random seed
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/japaneeg_processed")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        CHBMITLoader(os.path.join(root, "train"),
+                     train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        CHBMITLoader(os.path.join(root, "test"),
+                     test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        CHBMITLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
+
+def prepare_Yang2025_dataloader(args):
+    # set random seed
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/scratch_iteration2/yang2025_processed")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        Yang2025Loader(os.path.join(root, "train"),
+                       train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        Yang2025Loader(os.path.join(root, "test"),
+                       test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        Yang2025Loader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
+
+def prepare_Clinical_dataloader(args):
+    # set random seed
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/ds004504_processed")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        ClinicalLoader(os.path.join(root, "train"),
+                       train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        ClinicalLoader(os.path.join(root, "test"),
+                       test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        ClinicalLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
+
+def prepare_Dream_dataloader(args):
+    # set random seed
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/dream_processed")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        DreamLoader(os.path.join(root, "train"),
+                    train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        DreamLoader(os.path.join(root, "test"),
+                    test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        DreamLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
+
+def prepare_KaraOne_dataloader(args):
+    # set random seed
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/karaone_processed")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        KaraOneLoader(os.path.join(root, "train"),
+                      train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        KaraOneLoader(os.path.join(root, "test"),
+                      test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        KaraOneLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
+
 def prepare_PTB_dataloader(args):
     # set random seed
-    seed = 12345
+    seed = args.seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -264,9 +533,26 @@ def supervised(args):
     if args.dataset == "TUAB":
         train_loader, test_loader, val_loader = prepare_TUAB_dataloader(args)
 
+    elif args.dataset == "CHB-MIT":
+        train_loader, test_loader, val_loader = prepare_CHB_MIT_dataloader(args)
+
+    elif args.dataset == "JapanEEG":
+        train_loader, test_loader, val_loader = prepare_JapanEEG_dataloader(args)
+
+    elif args.dataset == "Yang2025":
+        train_loader, test_loader, val_loader = prepare_Yang2025_dataloader(args)
+
+    elif args.dataset == "Clinical":
+        train_loader, test_loader, val_loader = prepare_Clinical_dataloader(args)
+
+    elif args.dataset == "Dream":
+        train_loader, test_loader, val_loader = prepare_Dream_dataloader(args)
+
+    elif args.dataset == "KaraOne":
+        train_loader, test_loader, val_loader = prepare_KaraOne_dataloader(args)
+
     else:
         raise NotImplementedError
-
     # define the model
     if args.model == "SPaRCNet":
         model = SPaRCNet(
@@ -330,17 +616,29 @@ def supervised(args):
             hop_length=args.hop_length,
         )
         if args.pretrain_model_path and (args.sampling_rate == 200):
-            model.biot.load_state_dict(torch.load(args.pretrain_model_path))
-            print(f"load pretrain model from {args.pretrain_model_path}")
+            ckpt = torch.load(args.pretrain_model_path)
 
+            model_state = model.biot.state_dict()
+
+            skip_keys = [k for k in ckpt if k in model_state and ckpt[k].shape != model_state[k].shape]
+
+            if skip_keys:
+                print(f"Skipping mismatched pretrained keys (channel-count dependent, reinitialized randomly): {skip_keys}")
+
+            filtered_ckpt = {k: v for k, v in ckpt.items() if k not in skip_keys}
+
+            missing, unexpected = model.biot.load_state_dict(filtered_ckpt, strict=False)
+
+            print(f"Loaded pretrained weights with strict=False. Missing keys: {missing}")
+            print(f"load pretrain model from {args.pretrain_model_path}")
     else:
         raise NotImplementedError
     lightning_model = LitModel_finetune(args, model)
 
     # logger and callbacks
-    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
+    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}-{'pretrained' if args.pretrain_model_path else 'random'}"
     logger = TensorBoardLogger(
-        save_dir="./",
+        save_dir=os.environ["SCRATCH"] + "/biot_logs",
         version=version,
         name="log",
     )
@@ -352,7 +650,6 @@ def supervised(args):
         devices=[0],
         accelerator="gpu",
         strategy=DDPStrategy(find_unused_parameters=False),
-        auto_select_gpus=True,
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,
@@ -384,6 +681,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int,
                         default=32, help="number of workers")
     parser.add_argument("--dataset", type=str, default="TUAB", help="dataset")
+    parser.add_argument("--seed", type=int, default=12345, help="random seed")
     parser.add_argument(
         "--model", type=str, default="SPaRCNet", help="which supervised model to use"
     )
@@ -409,5 +707,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     print(args)
-
     supervised(args)

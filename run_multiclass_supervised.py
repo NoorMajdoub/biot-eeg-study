@@ -22,8 +22,8 @@ from model import (
     STTransformer,
     BIOTClassifier,
 )
-from utils import TUEVLoader, HARLoader
-
+import json
+from utils import TUEVLoader, HARLoader, ISRUCLoader, ThoughtVizLoader, CAUEEGLoader, SleepEDFLoader
 
 class LitModel_finetune(pl.LightningModule):
     def __init__(self, args, model):
@@ -55,10 +55,11 @@ class LitModel_finetune(pl.LightningModule):
 
         result = np.concatenate(result, axis=0)
         result = multiclass_metrics_fn(
-            gt, result, metrics=["accuracy", "cohen_kappa", "f1_weighted"]
+            gt, result, metrics=["accuracy", "cohen_kappa", "f1_weighted","balanced_accuracy"]
         )
         self.log("val_acc", result["accuracy"], sync_dist=True)
         self.log("val_cohen", result["cohen_kappa"], sync_dist=True)
+        self.log("val_bacc", result["balanced_accuracy"], sync_dist=True)
         self.log("val_f1", result["f1_weighted"], sync_dist=True)
         print(result)
 
@@ -79,10 +80,11 @@ class LitModel_finetune(pl.LightningModule):
 
         result = np.concatenate(result, axis=0)
         result = multiclass_metrics_fn(
-            gt, result, metrics=["accuracy", "cohen_kappa", "f1_weighted"]
+            gt, result, metrics=["accuracy", "cohen_kappa", "f1_weighted","balanced_accuracy"]
         )
         self.log("test_acc", result["accuracy"], sync_dist=True)
         self.log("test_cohen", result["cohen_kappa"], sync_dist=True)
+        self.log("val_bacc", result["balanced_accuracy"], sync_dist=True)
         self.log("test_f1", result["f1_weighted"], sync_dist=True)
 
         return result
@@ -96,7 +98,46 @@ class LitModel_finetune(pl.LightningModule):
 
         return [optimizer]  # , [scheduler]
 
+def prepare_CAUEEG_dataloader(args):
+    seed = args.seed if hasattr(args, "seed") else 12345
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/caueeg/caueeg-dataset/splits")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        CAUEEGLoader(os.path.join(root, "train"), train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        CAUEEGLoader(os.path.join(root, "test"), test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        CAUEEGLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+    
 def prepare_TUEV_dataloader(args):
     # set random seed
     seed = 4523
@@ -198,10 +239,136 @@ def prepare_HAR_dataloader(args):
     return train_loader, test_loader, val_loader
 
 
+def prepare_ISRUC_dataloader(args):
+    # set random seed
+    seed = args.seed if hasattr(args, "seed") else 12345
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/isruc_biot_processed")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        ISRUCLoader(os.path.join(root, "train"),
+                    train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        ISRUCLoader(os.path.join(root, "test"),
+                    test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        ISRUCLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
+def prepare_SleepEDF_dataloader(args):
+    seed = args.seed if hasattr(args, "seed") else 12345
+    torch.manual_seed(seed); torch.cuda.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/sleepedf_reve_processed")
+    with open(os.path.join(root, "split.json")) as f:
+        split = json.load(f)
+
+    print(len(split["train"]), len(split["val"]), len(split["test"]))
+
+    train_loader = torch.utils.data.DataLoader(
+        SleepEDFLoader(root, split["train"], args.sampling_rate),
+        batch_size=args.batch_size, shuffle=True, drop_last=True,
+        num_workers=args.num_workers, persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        SleepEDFLoader(root, split["test"], args.sampling_rate),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        SleepEDFLoader(root, split["val"], args.sampling_rate),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+    
+    
+def prepare_ThoughtViz_dataloader(args):
+    # set random seed
+    seed = args.seed if hasattr(args, "seed") else 12345
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    root = os.environ.get("BIOT_DATA_ROOT_OVERRIDE", "/scratch/nourmaj/thoughtviz_processed")
+
+    train_files = os.listdir(os.path.join(root, "train"))
+    val_files = os.listdir(os.path.join(root, "val"))
+    test_files = os.listdir(os.path.join(root, "test"))
+
+    print(len(train_files), len(val_files), len(test_files))
+
+    train_loader = torch.utils.data.DataLoader(
+        ThoughtVizLoader(os.path.join(root, "train"),
+                         train_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        ThoughtVizLoader(os.path.join(root, "test"),
+                         test_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        ThoughtVizLoader(os.path.join(root, "val"), val_files, args.sampling_rate),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        persistent_workers=True,
+    )
+    print(len(train_loader), len(val_loader), len(test_loader))
+    return train_loader, test_loader, val_loader
+
+
 def supervised(args):
     # get data loaders
     if args.dataset == "TUEV":
         train_loader, test_loader, val_loader = prepare_TUEV_dataloader(args)
+
+    elif args.dataset == "HAR":
+        train_loader, test_loader, val_loader = prepare_HAR_dataloader(args)
+
+    elif args.dataset == "ISRUC":
+        train_loader, test_loader, val_loader = prepare_ISRUC_dataloader(args)
+
+    elif args.dataset == "ThoughtViz":
+        train_loader, test_loader, val_loader = prepare_ThoughtViz_dataloader(args)
 
     else:
         raise NotImplementedError
@@ -270,7 +437,24 @@ def supervised(args):
             hop_length=args.hop_length,
         )
         if args.pretrain_model_path and (args.sampling_rate == 200):
-            model.biot.load_state_dict(torch.load(args.pretrain_model_path))
+            ckpt = torch.load(args.pretrain_model_path)
+
+            model_state = model.biot.state_dict()
+
+            # Same channel-mismatch handling as run_binary_supervised.py:
+            # skip any pretrained keys whose shape doesn't match this
+            # dataset's channel count (e.g. ISRUC has 6 channels vs. the
+            # checkpoint's 18) instead of crashing on a strict load.
+            skip_keys = [k for k in ckpt if k in model_state and ckpt[k].shape != model_state[k].shape]
+
+            if skip_keys:
+                print(f"Skipping mismatched pretrained keys (channel-count dependent, reinitialized randomly): {skip_keys}")
+
+            filtered_ckpt = {k: v for k, v in ckpt.items() if k not in skip_keys}
+
+            missing, unexpected = model.biot.load_state_dict(filtered_ckpt, strict=False)
+
+            print(f"Loaded pretrained weights with strict=False. Missing keys: {missing}")
             print(f"load pretrain model from {args.pretrain_model_path}")
 
     else:
@@ -278,9 +462,9 @@ def supervised(args):
     lightning_model = LitModel_finetune(args, model)
 
     # logger and callbacks
-    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}"
+    version = f"{args.dataset}-{args.model}-{args.lr}-{args.batch_size}-{args.sampling_rate}-{args.token_size}-{args.hop_length}-{'pretrained' if args.pretrain_model_path else 'random'}"
     logger = TensorBoardLogger(
-        save_dir="./",
+        save_dir=os.environ["SCRATCH"] + "/biot_logs",
         version=version,
         name="log",
     )
@@ -292,7 +476,6 @@ def supervised(args):
         devices=[0],
         accelerator="gpu",
         strategy=DDPStrategy(find_unused_parameters=False),
-        auto_select_gpus=True,
         benchmark=True,
         enable_checkpointing=True,
         logger=logger,
@@ -324,6 +507,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int,
                         default=32, help="number of workers")
     parser.add_argument("--dataset", type=str, default="TUAB", help="dataset")
+    parser.add_argument("--seed", type=int, default=12345, help="random seed")
     parser.add_argument(
         "--model", type=str, default="SPaRCNet", help="which supervised model to use"
     )
